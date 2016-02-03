@@ -641,21 +641,85 @@ class I3status(Thread):
         self.last_prefix = ','
         self.update_json_list()
 
+class ModulesCtrl:
+    """
+    Responsible to refresh modules.
+    """
+
+    def __init__(self, modules, config):
+        self.config = config
+        self.modules = modules
+        self.last_refresh_ts = time()
+
+    def clear_modules_cache(self):
+        """
+        For every module, reset the 'cached_until' of all its methods.
+        """
+        for module in self.modules.values():
+            module.clear_cache()
+            module.produce_event.set()
+
+    def refresh_all(self):
+        """
+        Refresh all modules by forcing i3status to refresh by sending it a SIGUSR1
+        and we clear all py3status modules' cache.
+
+        To prevent abuse, we rate limit this function to 100ms.
+        """
+        if time() > (self.last_refresh_ts + 0.1):
+            syslog(LOG_INFO, 'forcing refresh')
+
+            # send SIGUSR1 to i3status
+            call(['killall', '-s', 'USR1', 'i3status'])
+
+            # clear the cache of all modules
+            self.clear_modules_cache()
+
+            # reset the refresh timestamp
+            self.last_refresh_ts = time()
+        else:
+            syslog(LOG_INFO,
+                   'should refresh but rate limit is in effect, calm down')
+
+    def refresh(self, module_name):
+        """
+        Force a cache expiration for all the methods of the given module.
+
+        We rate limit the i3status refresh to 100ms.
+        """
+        module = self.modules.get(module_name)
+        if module is not None:
+            if self.config['debug']:
+                syslog(LOG_INFO, 'refresh module {}'.format(module_name))
+            for obj in module.methods.values():
+                obj['cached_until'] = time()
+
+            module.produce_event.set()
+        else:
+            if time() > (self.last_refresh_ts + 0.1):
+                if self.config['debug']:
+                    syslog(
+                        LOG_INFO,
+                        'refresh i3status for module {}'.format(module_name))
+                # send SIGUSR1 to i3status
+                call(['killall', '-s', 'USR1', 'i3status'])
+                self.last_refresh_ts = time()
+
 class Events(Thread):
     """
     This class is responsible for dispatching event JSONs sent by the i3bar.
     """
 
-    def __init__(self, lock, config, modules, i3s_config):
+    def __init__(self, lock, config, modules, modules_ctrl, i3s_config):
         """
         We need to poll stdin to receive i3bar messages.
         """
         Thread.__init__(self)
         self.config = config
         self.i3s_config = i3s_config
-        self.last_refresh_ts = time()
         self.lock = lock
         self.modules = modules
+        self.modules_ctrl = modules_ctrl
         self.on_click = i3s_config['on_click']
         self.poller_inp = IOPoller(sys.stdin)
 
@@ -678,7 +742,7 @@ class Events(Thread):
 
         # to make the bar more responsive to users we ask for a refresh
         # of the module or of i3status if the module is an i3status one
-        self.refresh(module_name)
+        self.modules_ctrl.refresh(module_name)
 
     def i3bar_click_events_module(self):
         """
@@ -696,62 +760,29 @@ class Events(Thread):
         else:
             return False
 
-    def refresh(self, module_name):
-        """
-        Force a cache expiration for all the methods of the given module.
-
-        We rate limit the i3status refresh to 100ms.
-        """
-        module = self.modules.get(module_name)
-        if module is not None:
-            if self.config['debug']:
-                syslog(LOG_INFO, 'refresh module {}'.format(module_name))
-            for obj in module.methods.values():
-                obj['cached_until'] = time()
-
-            module.produce_event.set()
-        else:
-            if time() > (self.last_refresh_ts + 0.1):
-                if self.config['debug']:
-                    syslog(
-                        LOG_INFO,
-                        'refresh i3status for module {}'.format(module_name))
-                call(['killall', '-s', 'USR1', 'i3status'])
-                self.last_refresh_ts = time()
-
-
-
-    def refresh_all(self, module_name):
-        """
-        Force a full refresh of py3status and i3status modules by sending
-        a SIGUSR1 signal to py3status.
-
-        We rate limit this command to 100ms for obvious abusive behavior.
-        """
-        if time() > (self.last_refresh_ts + 0.1):
-            call(['killall', '-s', 'USR1', 'py3status'])
-            self.last_refresh_ts = time()
-
     def on_click_dispatcher(self, module_name, command):
         """
         Dispatch on_click config parameters to either:
             - Our own methods for special py3status commands (listed below)
             - The i3-msg program which is part of i3wm
         """
-        py3_commands = ['refresh', 'refresh_all']
+        py3_commands = {
+            'refresh': self.modules_ctrl.refresh(mod_name),
+            'refresh_all': lambda mod_name: self.modules_ctrl.refresh_all(),
+        }
+
         if command is None:
             return
         elif command in py3_commands:
             # this is a py3status command handled by this class
-            method = getattr(self, command)
-            method(module_name)
+            py3_commands[command](module_name)
         else:
             # this is a i3 message
             self.i3_msg(module_name, command)
 
             # to make the bar more responsive to users we ask for a refresh
             # of the module or of i3status if the module is an i3status one
-            self.refresh(module_name)
+            self.modules_ctrl.refresh(module_name)
 
     @staticmethod
     def i3_msg(module_name, command):
@@ -1159,7 +1190,6 @@ class Py3statusWrapper():
         """
         Useful variables we'll need.
         """
-        self.last_refresh_ts = time()
         self.lock = Event()
         self.modules = {}
         self.py3_modules = []
@@ -1395,8 +1425,10 @@ class Py3statusWrapper():
                 'started' if not self.config['standalone'] else 'mocked',
                 self.i3status_thread.config))
 
+        self.modules_ctrl = ModulesCtrl(self.modules, self.config)
+
         # setup input events thread
-        self.events_thread = Events(self.lock, self.config, self.modules,
+        self.events_thread = Events(self.lock, self.config, self.modules, self.modules_ctrl,
                                     self.i3status_thread.config)
         self.events_thread.start()
         if self.config['debug']:
@@ -1449,34 +1481,10 @@ class Py3statusWrapper():
 
     def sig_handler(self, signum, frame):
         """
-        SIGUSR1 was received, the user asks for an immediate refresh of the bar
-        so we force i3status to refresh by sending it a SIGUSR1
-        and we clear all py3status modules' cache.
-
-        To prevent abuse, we rate limit this function to 100ms.
+        SIGUSR1 was received, the user asks for an immediate refresh of the bar.
         """
-        if time() > (self.last_refresh_ts + 0.1):
-            syslog(LOG_INFO, 'received USR1, forcing refresh')
-
-            # send SIGUSR1 to i3status
-            call(['killall', '-s', 'USR1', 'i3status'])
-
-            # clear the cache of all modules
-            self.clear_modules_cache()
-
-            # reset the refresh timestamp
-            self.last_refresh_ts = time()
-        else:
-            syslog(LOG_INFO,
-                   'received USR1 but rate limit is in effect, calm down')
-
-    def clear_modules_cache(self):
-        """
-        For every module, reset the 'cached_until' of all its methods.
-        """
-        for module in self.modules.values():
-            module.clear_cache()
-            module.produce_event.set()
+        syslog(LOG_INFO, 'USR1 signal received, initiate refresh')
+        self.modules_ctrl.refresh_all()
 
     def terminate(self, signum, frame):
         """
