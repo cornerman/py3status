@@ -36,6 +36,7 @@ except ImportError:
 # Used in development
 enable_profiling = False
 
+receive_event = Event()
 
 def profile(thread_run_fn):
     if not enable_profiling:
@@ -581,6 +582,7 @@ class I3status(Thread):
                                     # the time and tztime modules
                                     self.set_time_modules()
                                 self.ready = True
+                                receive_event.set()
                             elif not line.startswith(','):
                                 if 'version' in line:
                                     header = loads(line)
@@ -594,6 +596,8 @@ class I3status(Thread):
                                     self.last_prefix = prefix
                                     self.update_json_list()
                                     self.set_responses(json_list)
+                                receive_event.set()
+
                         else:
                             err = self.poller_err.readline()
                             code = i3status_pipe.poll()
@@ -636,7 +640,6 @@ class I3status(Thread):
         self.last_output_ts = datetime.utcnow()
         self.last_prefix = ','
         self.update_json_list()
-
 
 class Events(Thread):
     """
@@ -705,6 +708,8 @@ class Events(Thread):
                 syslog(LOG_INFO, 'refresh module {}'.format(module_name))
             for obj in module.methods.values():
                 obj['cached_until'] = time()
+
+            module.produce_event.set()
         else:
             if time() > (self.last_refresh_ts + 0.1):
                 if self.config['debug']:
@@ -713,6 +718,8 @@ class Events(Thread):
                         'refresh i3status for module {}'.format(module_name))
                 call(['killall', '-s', 'USR1', 'i3status'])
                 self.last_refresh_ts = time()
+
+
 
     def refresh_all(self, module_name):
         """
@@ -936,6 +943,7 @@ class Module(Thread):
         self.module_class = None
         self.module_inst = ''.join(module.split(' ')[1:])
         self.module_name = module.split(' ')[0]
+        self.produce_event = Event()
         #
         self.load_methods(module, user_modules)
 
@@ -1125,8 +1133,11 @@ class Module(Thread):
                     syslog(LOG_WARNING,
                            'user method {} failed ({})'.format(meth, err))
 
+            receive_event.set()
+
             # don't be hasty mate, let's take it easy for now
-            sleep(self.config['interval'])
+            self.produce_event.wait(self.config['interval'])
+            self.produce_event.clear()
 
         # check and execute the 'kill' method if present
         if self.has_kill:
@@ -1465,6 +1476,7 @@ class Py3statusWrapper():
         """
         for module in self.modules.values():
             module.clear_cache()
+            module.produce_event.set()
 
     def terminate(self, signum, frame):
         """
@@ -1550,8 +1562,10 @@ class Py3statusWrapper():
             self.i3status_thread.update_json_list()
 
             # sleep a bit before doing this again to avoid killing the CPU
-            delta += 0.1
-            sleep(0.1)
+            prewait_time = time()
+            receive_event.wait(self.config['interval'])
+            receive_event.clear()
+            delta += time() - prewait_time
 
     @staticmethod
     def print_module_description(details, mod_name, mod_info):
