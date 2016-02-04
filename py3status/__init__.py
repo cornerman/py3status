@@ -545,6 +545,10 @@ class I3status(Thread):
                 self.write_in_tmpfile('}\n\n', tmpfile)
         tmpfile.flush()
 
+    def refresh(self):
+        if self.i3status_pipe:
+            self.i3status_pipe.send_signal(SIGUSR1)
+
     @profile
     def run(self):
         """
@@ -557,12 +561,12 @@ class I3status(Thread):
                        'i3status spawned using config file {}'.format(
                            tmpfile.name))
 
-                i3status_pipe = Popen(
+                self.i3status_pipe = Popen(
                     ['i3status', '-c', tmpfile.name],
                     stdout=PIPE,
                     stderr=PIPE, )
-                self.poller_inp = IOPoller(i3status_pipe.stdout)
-                self.poller_err = IOPoller(i3status_pipe.stderr)
+                self.poller_inp = IOPoller(self.i3status_pipe.stdout)
+                self.poller_err = IOPoller(self.i3status_pipe.stderr)
                 self.tmpfile_path = tmpfile.name
 
                 try:
@@ -600,7 +604,7 @@ class I3status(Thread):
 
                         else:
                             err = self.poller_err.readline()
-                            code = i3status_pipe.poll()
+                            code = self.i3status_pipe.poll()
                             if code is not None:
                                 msg = 'i3status died'
                                 if err:
@@ -646,9 +650,10 @@ class ModulesCtrl:
     Responsible to refresh modules.
     """
 
-    def __init__(self, modules, config):
+    def __init__(self, modules, config, i3status):
         self.config = config
         self.modules = modules
+        self.i3status = i3status
         self.last_refresh_ts = time()
 
     def clear_modules_cache(self):
@@ -670,7 +675,7 @@ class ModulesCtrl:
             syslog(LOG_INFO, 'forcing refresh')
 
             # send SIGUSR1 to i3status
-            call(['killall', '-s', 'USR1', 'i3status'])
+            self.i3status.refresh()
 
             # clear the cache of all modules
             self.clear_modules_cache()
@@ -702,7 +707,7 @@ class ModulesCtrl:
                         LOG_INFO,
                         'refresh i3status for module {}'.format(module_name))
                 # send SIGUSR1 to i3status
-                call(['killall', '-s', 'USR1', 'i3status'])
+                self.i3status.refresh()
                 self.last_refresh_ts = time()
 
 class Events(Thread):
@@ -1425,7 +1430,7 @@ class Py3statusWrapper():
                 'started' if not self.config['standalone'] else 'mocked',
                 self.i3status_thread.config))
 
-        self.modules_ctrl = ModulesCtrl(self.modules, self.config)
+        self.modules_ctrl = ModulesCtrl(self.modules, self.config, self.i3status_thread)
 
         # setup input events thread
         self.events_thread = Events(self.lock, self.config, self.modules, self.modules_ctrl,
