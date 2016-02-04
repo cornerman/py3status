@@ -662,7 +662,6 @@ class ModulesCtrl:
         """
         for module in self.modules.values():
             module.clear_cache()
-            module.produce_event.set()
 
     def refresh_all(self):
         """
@@ -694,12 +693,7 @@ class ModulesCtrl:
         """
         module = self.modules.get(module_name)
         if module is not None:
-            if self.config['debug']:
-                syslog(LOG_INFO, 'refresh module {}'.format(module_name))
-            for obj in module.methods.values():
-                obj['cached_until'] = time()
-
-            module.produce_event.set()
+            module.clear_cache()
         else:
             if time() > (self.last_refresh_ts + 0.1):
                 if self.config['debug']:
@@ -1019,6 +1013,8 @@ class Module(Thread):
             self.methods[meth]['cached_until'] = time()
             if self.config['debug']:
                 syslog(LOG_INFO, 'clearing cache for method {}'.format(meth))
+
+        self.produce_event.set()
 
     def load_methods(self, module, user_modules):
         """
